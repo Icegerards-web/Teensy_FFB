@@ -18,10 +18,16 @@
 //   information through DirectInput, which is why BeamNG, LFS and F1 can bind
 //   our axes without any driver.
 //
-//   For this step we use the descriptor that ships with Teensyduino (USB Type
-//   "Serial + Keyboard + Mouse + Joystick"): 6 axes of 0..1023, 32 buttons and
-//   a hat switch. Step 3 (force feedback) needs our own descriptor with the
-//   extra "PID" force-feedback section; that is when we'll replace it.
+//   Two USB types work with this sketch (Arduino IDE: Tools > USB Type):
+//    - "Serial + FFB Wheel" (needs tools/patch_teensy_core.py once): our own
+//      descriptor with 16-bit axes PLUS the "PID" force-feedback section, so
+//      games can send forces. This is the normal choice.
+//    - "Serial + Keyboard + Mouse + Joystick": Teensyduino's stock joystick
+//      (10-bit axes), no game forces. Handy for testing without the patch.
+//
+//  Force feedback (step 3): see FfbEngine.h for how game effects arrive and
+//  are turned into one torque, and ForceSafety.h for what stands between that
+//  torque and the motor.
 //
 //  Axis mapping (games let you re-bind these, so the names don't matter much):
 //    X        = steering       Y       = throttle
@@ -35,12 +41,13 @@
 #include "Bts7960Driver.h"
 #include "Calibration.h"
 #include "Debouncer.h"
+#include "FfbUsb.h"
 #include "ForceSafety.h"
 #include "PotPositionSensor.h"
 #include "config.h"
 
 #if !defined(USB_SERIAL_HID) && !defined(JOYSTICK_INTERFACE)
-#error "Set Tools > USB Type to 'Serial + Keyboard + Mouse + Joystick' in the Arduino IDE."
+#error "Set Tools > USB Type to 'Serial + FFB Wheel' (or 'Serial + Keyboard + Mouse + Joystick' without force feedback)."
 #endif
 
 // ----- The steering sensor ---------------------------------------------------
@@ -55,7 +62,8 @@ Bts7960Driver bts7960(MOTOR_RPWM_PIN, MOTOR_LPWM_PIN, MOTOR_ENABLE_PIN, MOTOR_IN
 MotorDriver& motor = bts7960;
 
 ForceSafety safety;
-axis::VelocityEstimator velocity;
+axis::VelocityEstimator velocity;      // wheel speed, deg/s
+axis::VelocityEstimator acceleration;  // change of speed, deg/s^2 (for inertia)
 
 // ----- Pedals ----------------------------------------------------------------
 struct Pedal {
@@ -73,6 +81,11 @@ struct Pedal {
     if (pin < 0) return axis::OUT_MIN;
     return axis::pedalToAxis(raw, cal->rawMin, cal->rawMax,
                              PEDAL_DEADZONE_LOW, PEDAL_DEADZONE_HIGH, invert);
+  }
+  uint16_t axisValue16() const {
+    if (pin < 0) return 0;
+    return axis::pedalToAxis16(raw, cal->rawMin, cal->rawMax,
+                               PEDAL_DEADZONE_LOW, PEDAL_DEADZONE_HIGH, invert);
   }
 };
 
@@ -132,6 +145,7 @@ void applyCalibrationToSafety() {
   safety.settings.halfRangeDeg = cal.steeringRangeDeg * 0.5f;
   safety.settings.slewPerMs = TORQUE_SLEW_PER_MS;
   safety.settings.sensorFaultMs = SENSOR_FAULT_MS;
+  ffbEngine.settings.invertDirectional = cal.ffbInvert;
 }
 
 // =============================================================================
@@ -159,16 +173,19 @@ void setup() {
   }
   if (ESTOP_PIN >= 0) pinMode(ESTOP_PIN, INPUT_PULLUP);
 
+#if !HAVE_FFB
   // "Manual send" = only send a USB report when we call send_now(), so all
   // axes and buttons arrive at the PC together in one consistent snapshot.
   Joystick.useManualSend(true);
+#endif
 
   // Give the Serial Monitor a moment to connect, but never wait for it:
   // the wheel must work in games without anything listening on Serial.
   uint32_t start = millis();
   while (!Serial && millis() - start < 1500) {
   }
-  Serial.println(F("\nTeensy FFB wheel - step 2 (USB controller + safe motor drive)"));
+  Serial.println(HAVE_FFB ? F("\nTeensy FFB wheel - force feedback enabled (USB type: Serial + FFB Wheel)")
+                          : F("\nTeensy FFB wheel - NO force feedback (stock joystick USB type)"));
   Serial.println(loaded ? F("Loaded saved calibration.")
                         : F("No saved calibration found, using defaults. Type 'help'."));
   Serial.println(motorArmed ? F("Motor is ARMED (autoarm is on).")
@@ -210,6 +227,15 @@ void readInputs() {
 
 // Returns true if the PC accepted the report (used by the host watchdog).
 bool sendReport() {
+#if HAVE_FFB
+  uint32_t bits = 0;
+  for (int i = 0; i < NUM_BUTTONS; i++) {
+    if (buttons[i].pressed()) bits |= (1UL << i);
+  }
+  return ffbSendWheelReport(axis::steeringToAxis16(steering.angleDeg(), cal.steeringRangeDeg),
+                            throttle.axisValue16(), brake.axisValue16(), clutch.axisValue16(),
+                            bits);
+#else
   Joystick.X(axis::steeringToAxis(steering.angleDeg(), cal.steeringRangeDeg));
   Joystick.Y(throttle.axisValue());
   Joystick.Z(brake.axisValue());
@@ -223,6 +249,7 @@ bool sendReport() {
   // usb_joystick_send() is what Joystick.send_now() calls inside; using it
   // directly tells us whether the PC took the report (0) or not (-1).
   return usb_joystick_send() == 0;
+#endif
 }
 
 // Work out the torque we'd like, then let the safety layer decide.
@@ -230,8 +257,15 @@ void updateMotor() {
   uint32_t now = millis();
   float requested = 0;
 
-  // Step 2 has no game forces yet; only the "motor test" command asks for
-  // torque. (End stops are added inside ForceSafety.)
+  // --- Game forces -----------------------------------------------------------
+  // The engine wants position/speed as fractions (see FfbEngine.h WheelState).
+  ffb::WheelState w;
+  w.position = axis::steeringFraction(steering.angleDeg(), cal.steeringRangeDeg);
+  w.velocity = velocity.value() / FFB_FULL_SPEED_DEG_S;
+  w.acceleration = acceleration.value() / FFB_FULL_ACCEL_DEG_S2;
+  requested += ffbComputeForce(w, now) * cal.ffbGain;
+
+  // --- Test command (end stops are added inside ForceSafety) ------------------
   if (motorTestActive) {
     uint32_t t = now - motorTestStartMs;
     if (t < 500) requested = MOTOR_TEST_TORQUE;          // half a second right
@@ -282,6 +316,11 @@ void printHelp() {
       "  maxtorque N   motor power ceiling in percent (e.g. maxtorque 30)\n"
       "  endstop N     end-stop stiffness, percent torque per degree (e.g. 10)\n"
       "  autoarm on|off  enable the motor automatically at power-up\n"
+      "Force feedback:\n"
+      "  ffb           show what the game is doing (effects, gain)\n"
+      "  gain N        overall strength of game forces in percent (e.g. gain 70)\n"
+      "  invert on|off flip the direction of game forces (if the wheel pulls\n"
+      "                the wrong way in corners)\n"
       "Storage:\n"
       "  save          store settings so they survive power-off\n"
       "  reset         go back to default settings (then 'save' to keep)\n"
@@ -301,6 +340,29 @@ void printReadings() {
   for (int i = 0; i < NUM_BUTTONS; i++) Serial.print(buttons[i].pressed() ? '1' : '0');
   Serial.printf(" | motor %+5.1f%% (%s)\n", motor.torque() * 100.0f,
                 safetyStateName(safety.state()));
+}
+
+void printFfbStatus() {
+  if (!HAVE_FFB) {
+    Serial.println(F("No force feedback: select USB Type 'Serial + FFB Wheel'."));
+    return;
+  }
+  static const char* const names[] = {"-", "constant", "ramp", "square", "sine", "triangle",
+                                      "saw up", "saw down", "spring", "damper", "inertia",
+                                      "friction"};
+  Serial.printf("FFB: %d effects created, %d playing, device gain %d%%, actuators %s%s, "
+                "%lu reports received\n",
+                ffbEngine.allocatedCount(), ffbEngine.playingCount(),
+                ffbEngine.deviceGain() * 100 / 255, ffbEngine.actuatorsEnabled() ? "on" : "off",
+                ffbEngine.paused() ? " (paused)" : "", (unsigned long)ffbEngine.reportCount());
+  for (unsigned i = 1; i <= ffb_size::MAX_EFFECTS; i++) {
+    const ffb::Effect& e = ffbEngine.effect(i);
+    if (e.type == ffb::ET_NONE) continue;
+    Serial.printf("  #%-2u %-9s %s gain %3d%%\n", i, names[e.type],
+                  e.playing ? "PLAYING" : "stopped", e.gain * 100 / 255);
+  }
+  Serial.printf("Our settings: gain %.0f%%, invert %s, max torque %.0f%%\n", cal.ffbGain * 100,
+                cal.ffbInvert ? "on" : "off", cal.maxTorque * 100);
 }
 
 // Parses "on"/"off" after a command; returns -1 if neither.
@@ -395,6 +457,23 @@ void handleCommand(char* line) {
       Serial.println(v ? F("Motor will be enabled at power-up. Type 'save' to keep it.")
                        : F("Motor stays off at power-up. Type 'save' to keep it."));
     }
+  } else if (strcmp(line, "ffb") == 0) {
+    printFfbStatus();
+  } else if (strncmp(line, "gain ", 5) == 0) {
+    if (parsePercent(line + 5, 0, 200, pct)) {
+      cal.ffbGain = pct;
+      Serial.printf("FFB gain %.0f%%. Type 'save' to keep it.\n", pct * 100);
+    }
+  } else if (strncmp(line, "invert ", 7) == 0) {
+    int v = parseOnOff(line + 7);
+    if (v < 0) {
+      Serial.println(F("Use 'invert on' or 'invert off'."));
+    } else {
+      cal.ffbInvert = v;
+      applyCalibrationToSafety();
+      Serial.println(v ? F("Game forces inverted. Type 'save' to keep it.")
+                       : F("Game forces normal. Type 'save' to keep it."));
+    }
   } else if (strcmp(line, "save") == 0) {
     cal.steeringCenter = steering.centerCalibration();
     calibration::save(cal);
@@ -435,6 +514,7 @@ void loop() {
     sinceReport = 0;
     readInputs();
     velocity.update(steering.angleDeg(), REPORT_INTERVAL_US * 1e-6f);
+    acceleration.update(velocity.value(), REPORT_INTERVAL_US * 1e-6f);
     if (sendReport()) lastHostOkMs = millis();
     updateMotor();
   }

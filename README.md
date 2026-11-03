@@ -6,7 +6,7 @@ Firmware for a DIY force-feedback steering wheel on a **Teensy 4.0**.
 |------|------|--------|
 | 1 | Wheel, pedals, buttons and paddles show up as a USB game controller | done |
 | 2 | Safe motor drive (BTS7960) with limits, end stops and a watchdog | done |
-| 3 | Force feedback from games (HID PID / DirectInput) | later |
+| 3 | Force feedback from games (HID PID / DirectInput) | done (untested in games) |
 | 4 | Tuning and per-game testing (BeamNG, Live for Speed, F1 2020) | later |
 
 ## Files
@@ -22,6 +22,14 @@ firmware/teensy_ffb/
   MotorDriver.h         interface any motor driver must follow
   Bts7960Driver.h       the BTS7960 (IBT-2) version of that interface
   ForceSafety.h         faults, end stops, torque and slew limits for the motor
+  FfbEngine.h/.cpp      force-feedback effects from games -> one torque
+  FfbUsb.h/.cpp         connects the engine to the patched Teensy USB code
+  FfbReportSizes.h      generated: byte size of each USB report
+core_patch/usb_ffb_desc.h   generated: the USB HID descriptor (with force feedback)
+tools/
+  patch_teensy_core.py  adds the "Serial + FFB Wheel" USB type to Teensyduino
+  gen_ffb_descriptor.py generates the descriptor (only needed to change it)
+  pio_patch_core.py     PlatformIO runs the patch automatically with this
   Calibration.h         stores calibration in EEPROM so it survives power-off
 test/                   unit tests for AxisMath + Debouncer that run on a PC
 platformio.ini          optional PlatformIO build file
@@ -51,20 +59,28 @@ The pin numbers in `config.h` are placeholders until the real wiring is known.
 
 **Arduino IDE** (with Teensyduino installed):
 
-1. Open `firmware/teensy_ffb/teensy_ffb.ino`.
-2. Tools > Board > **Teensy 4.0**.
-3. Tools > USB Type > **Serial + Keyboard + Mouse + Joystick**. (This is what
-   makes the Teensy show up as a game controller. If you forget it, the sketch
-   stops with an error telling you so.)
-4. Upload.
+1. **Once** (and again after every Teensyduino update): close the Arduino IDE
+   and run `python tools/patch_teensy_core.py` from this folder. It finds your
+   Teensyduino install and adds a new USB type, "Serial + FFB Wheel". (Needs
+   Python 3. If it can't find Teensyduino, it tells you how to pass the path.)
+2. Open `firmware/teensy_ffb/teensy_ffb.ino`.
+3. Tools > Board > **Teensy 4.0**.
+4. Tools > USB Type > **Serial + FFB Wheel**.
+5. Upload.
+
+Without the patch you can still pick **Serial + Keyboard + Mouse + Joystick**:
+the wheel works as a plain controller and the motor still does end stops, but
+games can't send forces.
 
 **PlatformIO:** `pio run -t upload`, then `pio device monitor` for the menu.
+The patch is applied automatically.
 
 ## First-time setup
 
-1. On Windows, press Win+R, type `joy.cpl`, and open the Teensy's
-   **Properties**. You should see the X axis move as you turn the wheel, the
-   pedals on the Y / Z / Z-rotation axes and the buttons light up.
+1. On Windows, press Win+R, type `joy.cpl`. The wheel shows up as
+   **Teensy FFB Wheel** (or "Serial/Keyboard/Mouse/Joystick" with the stock
+   USB type). Open **Properties**: the X axis should move as you turn the
+   wheel, the pedals on Y / Z / Z-rotation, and the buttons should light up.
 2. Open the Serial Monitor (115200, line ending "Newline") and type `help`.
 3. Hold the wheel straight and type `center`.
 4. Type `range 270` (or whatever rotation you set in the game).
@@ -88,6 +104,19 @@ the wheel for the first test.
 5. `autoarm on` + `save` if you want the motor enabled at power-up.
 
 `motor off` disables it at any time.
+
+### Force feedback (step 3)
+
+With the "Serial + FFB Wheel" USB type, Windows sees a force-feedback device
+and games can use it. Our own `motor on` switch and all the safety limits
+still apply on top.
+
+- `ffb` shows what the game is doing right now: which effects it created,
+  which are playing, and the game's own strength setting.
+- `gain 70` sets the overall strength of game forces (percent; up to 200).
+- `invert on` flips the direction of the game's forces. If the wheel pulls
+  you *into* corners instead of back towards straight, turn this on. Springs
+  and dampers are calculated on the wheel and are never flipped.
 
 `monitor` prints all live readings 10 times per second, which is handy for
 checking wiring. A "SENSOR FAULT?" next to the steering reading means the pot is
@@ -137,14 +166,33 @@ so current can flow either way (= either direction). The Teensy switches it on
 and off 20,000 times a second; the fraction of "on" time (duty cycle) sets the
 average voltage, and with it roughly the torque.
 
+**Force feedback (HID PID).** A game doesn't send "torque = 40 %" every
+millisecond. It *creates effects* on the wheel and then mostly lets them run:
+a constant force (updated often), a centering spring, a damper, a sine-wave
+rumble, and so on. Windows' built-in PID driver turns the game's DirectInput
+calls into USB reports: "create a new effect" (we pick a free slot and report
+its number back), "set its values", "start it", "stop it". The descriptor that
+lists all these reports is generated by `tools/gen_ffb_descriptor.py`. Every
+millisecond `FfbEngine` adds up all playing effects, using the current wheel
+position and speed for springs, dampers and friction, and the result goes
+through the safety layer to the motor.
+
+**Why patch the Teensy core?** The USB descriptors and the code that answers
+the PC's USB requests are part of the Teensy core, which a sketch can't
+replace. The patch adds a new USB type with our descriptor and forwards the
+PC's force-feedback requests to the sketch. Everything is inside
+`#if defined(USB_FFB_WHEEL)`, so other USB types and projects are unchanged,
+and the original files are kept as `.orig`.
+
 **Debouncing.** A switch contact flickers for a few milliseconds when pressed.
 A press only counts once the pin has been steady for 5 ms, so one paddle pull is
 one gear change.
 
 ## Running the unit tests
 
-The axis math and the debouncer have no Arduino code in them, so they can be
-tested on a PC with a C++ compiler:
+The axis math, debouncer, safety layer and the whole force-feedback engine
+have no Arduino code in them, so they can be tested on a PC with a C++
+compiler. The FFB tests replay the same sequence of reports Windows sends:
 
 ```
 ./test/run_tests.sh
