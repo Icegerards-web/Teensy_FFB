@@ -44,6 +44,13 @@ static void testSteering() {
   CHECK_EQ(steeringToAxis(67.5f, 270), 767);
   // Invalid range falls back to center.
   CHECK_EQ(steeringToAxis(10, 0), 512);
+  // 16-bit version used by the force-feedback USB type.
+  CHECK_EQ(steeringToAxis16(0, 270), 0);
+  CHECK_EQ(steeringToAxis16(135, 270), 32767);
+  CHECK_EQ(steeringToAxis16(-300, 270), -32767);
+  CHECK_EQ(steeringToAxis16(67.5f, 270), 16384);
+  CHECK_EQ(pedalToAxis16(3000, 1000, 3000, 0.03f, 0.03f, false), 32767);
+  CHECK_EQ(pedalToAxis16(1000, 1000, 3000, 0.03f, 0.03f, false), 0);
 }
 
 static void testPot() {

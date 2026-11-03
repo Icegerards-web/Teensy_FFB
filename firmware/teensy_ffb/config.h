@@ -146,3 +146,9 @@ constexpr float DEFAULT_FFB_GAIN   = 0.70f;  // overall strength of game forces
 constexpr float DEFAULT_DAMPING    = 0.05f;  // always-on damping
 constexpr float DEFAULT_FRICTION   = 0.00f;  // always-on friction
 constexpr float DEFAULT_MIN_TORQUE = 0.00f;  // overcome motor/gear stiction
+
+// How the wheel's speed and acceleration are scaled for the damper, friction
+// and inertia effects: at this speed a damper of strength 100 % gives full
+// torque. Lower = those effects feel stronger.
+constexpr float FFB_FULL_SPEED_DEG_S  = 360.0f;   // one turn per second
+constexpr float FFB_FULL_ACCEL_DEG_S2 = 5000.0f;
