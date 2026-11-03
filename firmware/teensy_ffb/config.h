@@ -84,3 +84,65 @@ constexpr int POT_FAULT_MARGIN = 8;
 // ----- USB reporting ---------------------------------------------------------
 // How often we send the controller state to the PC. 1000 us = 1000 times/s.
 constexpr uint32_t REPORT_INTERVAL_US = 1000;
+
+// =============================================================================
+//  STEP 2: MOTOR (BTS7960 / "IBT-2" driver board)
+// =============================================================================
+//  Wiring (all PLACEHOLDERS until confirmed):
+//    BTS7960 RPWM  -> MOTOR_RPWM_PIN   (PWM pin: drives the motor one way)
+//    BTS7960 LPWM  -> MOTOR_LPWM_PIN   (PWM pin: drives the motor the other way)
+//    BTS7960 R_EN and L_EN, joined together -> MOTOR_ENABLE_PIN
+//    BTS7960 VCC   -> Teensy 3.3V    BTS7960 GND -> Teensy GND
+//    BTS7960 B+/B- -> motor power supply,  M+/M- -> motor
+//  Put a 10k resistor from the joined R_EN/L_EN wire to GND. Then, while the
+//  Teensy is booting or being re-programmed (pins floating), the driver stays
+//  switched OFF instead of possibly turning on.
+// =============================================================================
+constexpr int MOTOR_RPWM_PIN   = 8;   // <-- PLACEHOLDER
+constexpr int MOTOR_LPWM_PIN   = 9;   // <-- PLACEHOLDER
+constexpr int MOTOR_ENABLE_PIN = 10;  // <-- PLACEHOLDER
+
+// If positive torque turns the wheel LEFT instead of right, set true
+// (or swap the two motor wires). Check with the serial command "motor test".
+constexpr bool MOTOR_INVERT = false;
+
+// 20 kHz is above human hearing, so the motor doesn't whine.
+constexpr float MOTOR_PWM_FREQUENCY_HZ = 20000.0f;
+constexpr int MOTOR_PWM_BITS = 12;  // duty cycle 0..4095
+
+// Optional emergency stop button (to GND). Pressing it cuts the motor until
+// you type "motor on" again. -1 = no button.
+constexpr int ESTOP_PIN = -1;  // <-- PLACEHOLDER
+
+// ----- Safety defaults (each can be changed at run time and saved) ------------
+// Hard ceiling on motor power as a fraction of full power (0.30 = 30 %).
+// START LOW. Raise it with "maxtorque N" once everything behaves.
+constexpr float DEFAULT_MAX_TORQUE = 0.30f;
+
+// End stop: past the steering range (see "range"), a stiff virtual spring
+// pushes the wheel back. Torque per degree past the end, as a fraction.
+constexpr float DEFAULT_ENDSTOP_STIFFNESS = 0.10f;  // 10 % per degree
+
+// Biggest torque change allowed per millisecond. Prevents violent jolts:
+// 0.05 means going from 0 to 100 % takes at least 20 ms.
+constexpr float TORQUE_SLEW_PER_MS = 0.05f;
+
+// If the USB host (the PC) stops reading our reports for this long, the
+// motor is switched off. Happens on unplug, PC sleep or a hung driver.
+constexpr uint32_t HOST_TIMEOUT_MS = 100;
+
+// If the main loop stops running for this long (a firmware bug or crash),
+// a timer interrupt switches the motor off by itself.
+constexpr uint32_t LOOP_STALL_TIMEOUT_MS = 50;  // > the 30 ms USB send timeout
+
+// The steering sensor must look broken for this long before it counts as a
+// fault (avoids reacting to a single noisy reading).
+constexpr uint32_t SENSOR_FAULT_MS = 10;
+
+// =============================================================================
+//  STEPS 3-4: FORCE FEEDBACK DEFAULTS (all changeable via the serial menu)
+// =============================================================================
+constexpr float DEFAULT_FFB_GAIN   = 0.70f;  // overall strength of game forces
+constexpr float DEFAULT_DAMPING    = 0.05f;  // always-on damping
+constexpr float DEFAULT_FRICTION   = 0.00f;  // always-on friction
+constexpr float DEFAULT_MIN_TORQUE = 0.00f;  // overcome motor/gear stiction

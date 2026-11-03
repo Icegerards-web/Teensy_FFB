@@ -4,8 +4,8 @@ Firmware for a DIY force-feedback steering wheel on a **Teensy 4.0**.
 
 | Step | What | Status |
 |------|------|--------|
-| 1 | Wheel, pedals, buttons and paddles show up as a USB game controller | **this code** |
-| 2 | Safe motor drive (BTS7960) with limits, end stops and a watchdog | next |
+| 1 | Wheel, pedals, buttons and paddles show up as a USB game controller | done |
+| 2 | Safe motor drive (BTS7960) with limits, end stops and a watchdog | done |
 | 3 | Force feedback from games (HID PID / DirectInput) | later |
 | 4 | Tuning and per-game testing (BeamNG, Live for Speed, F1 2020) | later |
 
@@ -19,6 +19,9 @@ firmware/teensy_ffb/
   PotPositionSensor.h   the potentiometer version of that interface
   AxisMath.h            the math from raw readings to joystick values
   Debouncer.h           filters out switch bounce on buttons/paddles
+  MotorDriver.h         interface any motor driver must follow
+  Bts7960Driver.h       the BTS7960 (IBT-2) version of that interface
+  ForceSafety.h         faults, end stops, torque and slew limits for the motor
   Calibration.h         stores calibration in EEPROM so it survives power-off
 test/                   unit tests for AxisMath + Debouncer that run on a PC
 platformio.ini          optional PlatformIO build file
@@ -33,7 +36,14 @@ platformio.ini          optional PlatformIO build file
   (wiper) to the analog pin set in `config.h`.
 - **Buttons and paddles:** one side to the pin in `config.h`, other side to GND.
   No resistors needed: the code turns on the Teensy's internal pull-ups.
-- Pins 8 and 9 are kept free for the motor driver in step 2.
+- **BTS7960 motor driver (IBT-2 board):**
+  - RPWM to pin 8, LPWM to pin 9 (placeholders, see `config.h`)
+  - R_EN and L_EN joined together, to pin 10
+  - **a 10k resistor from that R_EN/L_EN wire to GND**, so the driver stays off
+    while the Teensy boots or is being programmed
+  - VCC to the Teensy 3.3V, GND to Teensy GND
+  - B+/B- to the motor power supply, M+/M- to the motor
+- **Optional e-stop button:** set `ESTOP_PIN` in `config.h`, wire to GND.
 
 The pin numbers in `config.h` are placeholders until the real wiring is known.
 
@@ -61,6 +71,23 @@ The pin numbers in `config.h` are placeholders until the real wiring is known.
 5. Type `pedals`, then within 8 seconds press each pedal all the way down and
    let it go.
 6. Type `save`. Calibration now survives unplugging.
+
+### Turning the motor on (step 2)
+
+The motor is **off** at every power-up until you allow it. Keep your hands off
+the wheel for the first test.
+
+1. `motor on` enables it. The end stops are now active: turn past full lock
+   and you'll feel the wheel push back.
+2. `motor test` pushes gently right for half a second, then left. If it goes
+   left first, set `MOTOR_INVERT = true` in `config.h` (or swap the motor
+   wires).
+3. `maxtorque 30` caps motor power at 30 % (the default). Raise it slowly.
+4. `endstop 10` sets how hard the end stop pushes back (percent torque per
+   degree past full lock).
+5. `autoarm on` + `save` if you want the motor enabled at power-up.
+
+`motor off` disables it at any time.
 
 `monitor` prints all live readings 10 times per second, which is handy for
 checking wiring. A "SENSOR FAULT?" next to the steering reading means the pot is
@@ -94,6 +121,21 @@ remove jitter.
 (see `PositionSensor.h`), which promises an angle in degrees. Switching to an
 encoder later means writing an `EncoderPositionSensor` class and changing one
 line in `teensy_ffb.ino`.
+
+**Motor safety.** Nothing talks to the motor directly. Every torque request
+goes through `ForceSafety`, which (1) gives zero torque if the motor isn't
+armed, the steering sensor looks broken, the PC has stopped reading our USB
+reports for 100 ms, or the e-stop is pressed, (2) adds the end-stop spring past
+full lock and removes any force pushing further out, (3) clamps to `maxtorque`,
+and (4) limits how fast torque can change so nothing jerks. On top of that a
+timer interrupt checks every millisecond that the main loop is still running;
+if it hasn't run for 50 ms, the interrupt switches the driver off by itself.
+Sensor and stall faults stay latched until you type `motor on`.
+
+**PWM and the H-bridge.** The BTS7960 can connect each motor wire to + or -,
+so current can flow either way (= either direction). The Teensy switches it on
+and off 20,000 times a second; the fraction of "on" time (duty cycle) sets the
+average voltage, and with it roughly the torque.
 
 **Debouncing.** A switch contact flickers for a few milliseconds when pressed.
 A press only counts once the pin has been steady for 5 ms, so one paddle pull is

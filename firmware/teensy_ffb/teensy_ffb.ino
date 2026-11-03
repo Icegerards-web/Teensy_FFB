@@ -1,11 +1,13 @@
 // =============================================================================
-//  teensy_ffb.ino  -  Step 1: the wheel as a plain USB game controller.
+//  teensy_ffb.ino  -  DIY force-feedback steering wheel on a Teensy 4.0
 // =============================================================================
 //
 //  What this sketch does, 1000 times per second:
 //    1. read the steering sensor, the pedal pots and the buttons
 //    2. turn those readings into joystick numbers (see AxisMath.h)
 //    3. send one "report" with all of them to the PC over USB
+//    4. work out the motor torque and pass it through the safety layer
+//       (ForceSafety.h) to the motor driver
 //
 //  How the PC knows we are a game controller (HID):
 //   USB devices describe themselves when plugged in. A "HID" (Human Interface
@@ -26,12 +28,14 @@
 //    Z        = brake          Z-rot   = clutch
 //    Buttons  = in the order of BUTTON_PINS in config.h (paddles first)
 //
-//  Serial calibration menu: open the Serial Monitor (115200 baud, "Newline"
-//  line ending) and type `help`.
+//  Serial menu: open the Serial Monitor (115200 baud, "Newline" line ending)
+//  and type `help`.
 // =============================================================================
 #include "AxisMath.h"
+#include "Bts7960Driver.h"
 #include "Calibration.h"
 #include "Debouncer.h"
+#include "ForceSafety.h"
 #include "PotPositionSensor.h"
 #include "config.h"
 
@@ -44,6 +48,14 @@
 // an encoder later: write an EncoderPositionSensor class and change this line.
 PotPositionSensor potSensor(STEERING_POT_PIN, POT_TRAVEL_DEG, STEERING_INVERT);
 PositionSensor& steering = potSensor;
+
+// ----- The motor driver ------------------------------------------------------
+// Same idea: the ONE place that decides which motor driver we use.
+Bts7960Driver bts7960(MOTOR_RPWM_PIN, MOTOR_LPWM_PIN, MOTOR_ENABLE_PIN, MOTOR_INVERT);
+MotorDriver& motor = bts7960;
+
+ForceSafety safety;
+axis::VelocityEstimator velocity;
 
 // ----- Pedals ----------------------------------------------------------------
 struct Pedal {
@@ -88,12 +100,46 @@ bool pedalCalActive = false;
 uint32_t pedalCalEndMs = 0;
 constexpr uint32_t PEDAL_CAL_DURATION_MS = 8000;
 
+// ----- Motor state -------------------------------------------------------------
+bool motorArmed = false;      // the user's on/off switch ("motor on"/"motor off")
+uint32_t lastHostOkMs = 0;    // last time the PC accepted a USB report
+uint32_t motorTestStartMs = 0;
+bool motorTestActive = false;
+constexpr float MOTOR_TEST_TORQUE = 0.15f;
+
+// Loop stall guard: the main loop writes the time into `loopHeartbeatMs` on
+// every pass. A timer interrupt (which keeps firing even if loop() is stuck)
+// checks it every millisecond, and if it hasn't changed for
+// LOOP_STALL_TIMEOUT_MS it cuts the motor itself.
+IntervalTimer stallGuardTimer;
+volatile uint32_t loopHeartbeatMs = 0;
+volatile bool loopStalled = false;
+
+void stallGuardIsr() {
+  if (millis() - loopHeartbeatMs > LOOP_STALL_TIMEOUT_MS) {
+    motor.emergencyStop();
+    loopStalled = true;
+  }
+}
+
 bool monitorOn = false;
 elapsedMicros sinceReport;   // Teensy helper: counts up microseconds by itself
 elapsedMillis sinceMonitor;
 
+void applyCalibrationToSafety() {
+  safety.settings.maxTorque = cal.maxTorque;
+  safety.settings.endstopStiffness = cal.endstopStiffness;
+  safety.settings.halfRangeDeg = cal.steeringRangeDeg * 0.5f;
+  safety.settings.slewPerMs = TORQUE_SLEW_PER_MS;
+  safety.settings.sensorFaultMs = SENSOR_FAULT_MS;
+}
+
 // =============================================================================
 void setup() {
+  // The motor driver goes first, so the motor is guaranteed off from the
+  // very start.
+  motor.begin();
+
   Serial.begin(115200);  // on a Teensy the baud rate is ignored; USB is always fast
 
   analogReadResolution(ADC_BITS);
@@ -101,6 +147,8 @@ void setup() {
 
   // Load saved calibration (or defaults on a fresh Teensy).
   bool loaded = calibration::load(cal);
+  applyCalibrationToSafety();
+  motorArmed = cal.armAtBoot;
 
   steering.begin();
   steering.setCenterCalibration(cal.steeringCenter);
@@ -109,6 +157,7 @@ void setup() {
     pinMode(BUTTON_PINS[i], INPUT_PULLUP);
     buttons[i] = Debouncer(BUTTON_DEBOUNCE_MS);
   }
+  if (ESTOP_PIN >= 0) pinMode(ESTOP_PIN, INPUT_PULLUP);
 
   // "Manual send" = only send a USB report when we call send_now(), so all
   // axes and buttons arrive at the PC together in one consistent snapshot.
@@ -119,9 +168,14 @@ void setup() {
   uint32_t start = millis();
   while (!Serial && millis() - start < 1500) {
   }
-  Serial.println(F("\nTeensy FFB wheel - step 1 (USB controller, no force feedback yet)"));
+  Serial.println(F("\nTeensy FFB wheel - step 2 (USB controller + safe motor drive)"));
   Serial.println(loaded ? F("Loaded saved calibration.")
                         : F("No saved calibration found, using defaults. Type 'help'."));
+  Serial.println(motorArmed ? F("Motor is ARMED (autoarm is on).")
+                            : F("Motor is off. Type 'motor on' to enable it."));
+
+  loopHeartbeatMs = millis();
+  stallGuardTimer.begin(stallGuardIsr, 1000);  // every 1000 us
 }
 
 // =============================================================================
@@ -154,7 +208,8 @@ void readInputs() {
   }
 }
 
-void sendReport() {
+// Returns true if the PC accepted the report (used by the host watchdog).
+bool sendReport() {
   Joystick.X(axis::steeringToAxis(steering.angleDeg(), cal.steeringRangeDeg));
   Joystick.Y(throttle.axisValue());
   Joystick.Z(brake.axisValue());
@@ -165,20 +220,71 @@ void sendReport() {
   for (int i = 0; i < NUM_BUTTONS; i++) {
     Joystick.button(i + 1, buttons[i].pressed());  // joystick buttons count from 1
   }
-  Joystick.send_now();
+  // usb_joystick_send() is what Joystick.send_now() calls inside; using it
+  // directly tells us whether the PC took the report (0) or not (-1).
+  return usb_joystick_send() == 0;
+}
+
+// Work out the torque we'd like, then let the safety layer decide.
+void updateMotor() {
+  uint32_t now = millis();
+  float requested = 0;
+
+  // Step 2 has no game forces yet; only the "motor test" command asks for
+  // torque. (End stops are added inside ForceSafety.)
+  if (motorTestActive) {
+    uint32_t t = now - motorTestStartMs;
+    if (t < 500) requested = MOTOR_TEST_TORQUE;          // half a second right
+    else if (t < 1000) requested = -MOTOR_TEST_TORQUE;   // half a second left
+    else {
+      motorTestActive = false;
+      Serial.println(F("Motor test done. Did it push right first, then left? "
+                       "If it went left first, set MOTOR_INVERT in config.h."));
+    }
+  }
+
+  SafetyInputs in;
+  in.requestedTorque = requested;
+  in.angleDeg = steering.angleDeg();
+  in.armed = motorArmed;
+  in.sensorHealthy = steering.healthy();
+  in.hostAlive = usb_configuration != 0 && (now - lastHostOkMs) < HOST_TIMEOUT_MS;
+  in.estopPressed = ESTOP_PIN >= 0 && digitalRead(ESTOP_PIN) == LOW;
+  in.loopStalled = loopStalled;
+  in.nowMs = now;
+
+  SafetyState before = safety.state();
+  float torque = safety.process(in);
+  motor.setTorque(torque);
+
+  SafetyState after = safety.state();
+  if (after != before && after != SafetyState::Ok && after != SafetyState::NotArmed) {
+    Serial.printf("Motor stopped: %s\n", safetyStateName(after));
+  }
+  if (in.estopPressed && motorArmed) {
+    motorArmed = false;  // e-stop also disarms, so letting go doesn't restart it
+  }
 }
 
 // ----- Serial menu -----------------------------------------------------------
 void printHelp() {
   Serial.println(F(
-      "Commands:\n"
-      "  show        print all readings once\n"
-      "  monitor     toggle printing readings 10x per second\n"
-      "  center      hold the wheel straight, then type this\n"
-      "  range N     set lock-to-lock rotation in degrees (e.g. range 270)\n"
-      "  pedals      8 s window: press each pedal fully and release it\n"
-      "  save        store calibration so it survives power-off\n"
-      "  reset       go back to default calibration (then 'save' to keep)\n"
+      "Calibration:\n"
+      "  show          print all readings once\n"
+      "  monitor       toggle printing readings 10x per second\n"
+      "  center        hold the wheel straight, then type this\n"
+      "  range N       set lock-to-lock rotation in degrees (e.g. range 270)\n"
+      "  pedals        8 s window: press each pedal fully and release it\n"
+      "Motor:\n"
+      "  motor on      enable the motor (also clears latched faults)\n"
+      "  motor off     disable the motor\n"
+      "  motor test    gentle push right, then left (checks direction)\n"
+      "  maxtorque N   motor power ceiling in percent (e.g. maxtorque 30)\n"
+      "  endstop N     end-stop stiffness, percent torque per degree (e.g. 10)\n"
+      "  autoarm on|off  enable the motor automatically at power-up\n"
+      "Storage:\n"
+      "  save          store settings so they survive power-off\n"
+      "  reset         go back to default settings (then 'save' to keep)\n"
       "Tip: match 'range' to the steering rotation set in the game."));
 }
 
@@ -193,10 +299,30 @@ void printReadings() {
   }
   Serial.print(F("buttons "));
   for (int i = 0; i < NUM_BUTTONS; i++) Serial.print(buttons[i].pressed() ? '1' : '0');
-  Serial.println();
+  Serial.printf(" | motor %+5.1f%% (%s)\n", motor.torque() * 100.0f,
+                safetyStateName(safety.state()));
+}
+
+// Parses "on"/"off" after a command; returns -1 if neither.
+int parseOnOff(const char* s) {
+  if (strcmp(s, "on") == 0) return 1;
+  if (strcmp(s, "off") == 0) return 0;
+  return -1;
+}
+
+// Parses a percentage and checks it is within lo..hi. Returns false if not.
+bool parsePercent(const char* s, float lo, float hi, float& out) {
+  float v = atof(s);
+  if (v < lo || v > hi) {
+    Serial.printf("Value must be between %.0f and %.0f.\n", lo, hi);
+    return false;
+  }
+  out = v / 100.0f;
+  return true;
 }
 
 void handleCommand(char* line) {
+  float pct;
   if (strcmp(line, "help") == 0 || strcmp(line, "?") == 0) {
     printHelp();
   } else if (strcmp(line, "show") == 0) {
@@ -214,6 +340,7 @@ void handleCommand(char* line) {
       Serial.println(F("Range must be between 30 and 1080 degrees."));
     } else {
       cal.steeringRangeDeg = deg;
+      applyCalibrationToSafety();
       Serial.printf("Steering range set to %.0f degrees. Type 'save' to keep it.\n", deg);
       if (deg > POT_TRAVEL_DEG) {
         Serial.println(F("Note: that is more than the pot can measure, so the axis "
@@ -229,6 +356,45 @@ void handleCommand(char* line) {
     pedalCalActive = true;
     pedalCalEndMs = millis() + PEDAL_CAL_DURATION_MS;
     Serial.println(F("Pedal calibration: press each pedal all the way down and release it..."));
+  } else if (strcmp(line, "motor on") == 0) {
+    safety.clearFaults();
+    loopStalled = false;
+    motorArmed = true;
+    Serial.println(F("Motor ON. Type 'motor off' to disable."));
+  } else if (strcmp(line, "motor off") == 0) {
+    motorArmed = false;
+    motorTestActive = false;
+    Serial.println(F("Motor OFF."));
+  } else if (strcmp(line, "motor test") == 0) {
+    if (!motorArmed) {
+      Serial.println(F("Type 'motor on' first."));
+    } else {
+      motorTestActive = true;
+      motorTestStartMs = millis();
+      Serial.println(F("Motor test: pushing right, then left. Keep your hands clear."));
+    }
+  } else if (strncmp(line, "maxtorque ", 10) == 0) {
+    if (parsePercent(line + 10, 0, 100, pct)) {
+      cal.maxTorque = pct;
+      applyCalibrationToSafety();
+      Serial.printf("Max torque %.0f%%. Type 'save' to keep it.\n", pct * 100);
+    }
+  } else if (strncmp(line, "endstop ", 8) == 0) {
+    if (parsePercent(line + 8, 0, 100, pct)) {
+      cal.endstopStiffness = pct;
+      applyCalibrationToSafety();
+      Serial.printf("End-stop stiffness %.0f%% per degree. Type 'save' to keep it.\n",
+                    pct * 100);
+    }
+  } else if (strncmp(line, "autoarm ", 8) == 0) {
+    int v = parseOnOff(line + 8);
+    if (v < 0) {
+      Serial.println(F("Use 'autoarm on' or 'autoarm off'."));
+    } else {
+      cal.armAtBoot = v;
+      Serial.println(v ? F("Motor will be enabled at power-up. Type 'save' to keep it.")
+                       : F("Motor stays off at power-up. Type 'save' to keep it."));
+    }
   } else if (strcmp(line, "save") == 0) {
     cal.steeringCenter = steering.centerCalibration();
     calibration::save(cal);
@@ -236,6 +402,7 @@ void handleCommand(char* line) {
   } else if (strcmp(line, "reset") == 0) {
     cal = calibration::defaults();
     steering.setCenterCalibration(cal.steeringCenter);
+    applyCalibrationToSafety();
     pedalCalActive = false;
     Serial.println(F("Defaults restored (not saved yet)."));
   } else if (line[0] != '\0') {
@@ -261,12 +428,15 @@ void pollSerial() {
 
 // =============================================================================
 void loop() {
+  loopHeartbeatMs = millis();
   pollSerial();
 
   if (sinceReport >= REPORT_INTERVAL_US) {
     sinceReport = 0;
     readInputs();
-    sendReport();
+    velocity.update(steering.angleDeg(), REPORT_INTERVAL_US * 1e-6f);
+    if (sendReport()) lastHostOkMs = millis();
+    updateMotor();
   }
 
   if (monitorOn && sinceMonitor >= 100) {

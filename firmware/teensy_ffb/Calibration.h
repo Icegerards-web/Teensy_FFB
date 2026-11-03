@@ -21,6 +21,17 @@ struct PedalCal {
   int32_t rawMax;  // reading with the pedal fully pressed
 };
 
+// Version 1 layout (step 1). Kept so an older save can be upgraded.
+struct CalibrationV1 {
+  uint32_t magic;
+  uint16_t version;
+  int32_t steeringCenter;
+  float steeringRangeDeg;
+  PedalCal throttle;
+  PedalCal brake;
+  PedalCal clutch;
+};
+
 struct Calibration {
   uint32_t magic;
   uint16_t version;
@@ -29,12 +40,22 @@ struct Calibration {
   PedalCal throttle;
   PedalCal brake;
   PedalCal clutch;
+  // --- added in version 2 (motor + force feedback) ---
+  float maxTorque;          // 0..1, hard ceiling on motor power
+  float endstopStiffness;   // torque per degree past full lock
+  uint8_t armAtBoot;        // 1 = motor allowed on as soon as it powers up
+  uint8_t ffbInvert;        // 1 = flip the direction of game forces
+  uint8_t reserved[2];
+  float ffbGain;            // 0..1, overall strength of game forces
+  float damping;            // 0..1, always-on "thick oil" feel, tames wobble
+  float friction;           // 0..1, always-on dry friction feel
+  float minTorque;          // 0..1, smallest torque that still moves the motor
 };
 
 namespace calibration {
 
 constexpr uint32_t MAGIC = 0x46464257;  // the letters "FFBW" as a number
-constexpr uint16_t VERSION = 1;
+constexpr uint16_t VERSION = 2;
 constexpr int EEPROM_ADDRESS = 0;
 
 inline Calibration defaults() {
@@ -46,17 +67,37 @@ inline Calibration defaults() {
   c.throttle = {0, ADC_MAX};
   c.brake = {0, ADC_MAX};
   c.clutch = {0, ADC_MAX};
+  c.maxTorque = DEFAULT_MAX_TORQUE;
+  c.endstopStiffness = DEFAULT_ENDSTOP_STIFFNESS;
+  c.armAtBoot = 0;
+  c.ffbInvert = 0;
+  c.reserved[0] = c.reserved[1] = 0;
+  c.ffbGain = DEFAULT_FFB_GAIN;
+  c.damping = DEFAULT_DAMPING;
+  c.friction = DEFAULT_FRICTION;
+  c.minTorque = DEFAULT_MIN_TORQUE;
   return c;
 }
 
 // Returns true if valid saved data was found; otherwise `out` gets defaults.
 inline bool load(Calibration& out) {
   EEPROM.get(EEPROM_ADDRESS, out);
-  if (out.magic != MAGIC || out.version != VERSION) {
+  if (out.magic == MAGIC && out.version == VERSION) return true;
+  if (out.magic == MAGIC && out.version == 1) {
+    // Saved by the step 1 firmware: keep the steering and pedal calibration,
+    // and use defaults for the new motor settings.
+    CalibrationV1 old;
+    EEPROM.get(EEPROM_ADDRESS, old);
     out = defaults();
-    return false;
+    out.steeringCenter = old.steeringCenter;
+    out.steeringRangeDeg = old.steeringRangeDeg;
+    out.throttle = old.throttle;
+    out.brake = old.brake;
+    out.clutch = old.clutch;
+    return true;
   }
-  return true;
+  out = defaults();
+  return false;
 }
 
 inline void save(const Calibration& c) {

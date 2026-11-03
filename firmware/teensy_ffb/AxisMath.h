@@ -70,4 +70,32 @@ inline int32_t pedalToAxis(int32_t raw, int32_t rawMin, int32_t rawMax,
   return fractionToAxis(f);
 }
 
+// Estimates how fast the wheel is turning (degrees per second) from two
+// angle readings in a row. The raw difference is noisy, so it is smoothed
+// with an "exponential moving average": each new value only moves the
+// estimate part of the way (`smoothing` = 0.1 means 10 % of the way).
+// Used by the damper and friction effects, which depend on wheel speed.
+class VelocityEstimator {
+ public:
+  explicit VelocityEstimator(float smoothing = 0.1f) : k_(smoothing) {}
+  float update(float angleDeg, float dtSeconds) {
+    if (!init_ || dtSeconds <= 0.0f) {
+      init_ = true;
+      last_ = angleDeg;
+      return vel_;
+    }
+    float raw = (angleDeg - last_) / dtSeconds;
+    last_ = angleDeg;
+    vel_ += k_ * (raw - vel_);
+    return vel_;
+  }
+  float value() const { return vel_; }
+
+ private:
+  float k_;
+  bool init_ = false;
+  float last_ = 0;
+  float vel_ = 0;
+};
+
 }  // namespace axis
