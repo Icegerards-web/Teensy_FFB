@@ -11,6 +11,7 @@
 #include "AxisMath.h"
 #include "Debouncer.h"
 #include "ForceSafety.h"
+#include "Tuning.h"
 
 static int failures = 0;
 #define CHECK_EQ(actual, expected)                                              \
@@ -206,7 +207,34 @@ static void testVelocity() {
   CHECK_NEAR(smooth.update(0.1f, 0.001f), 10.0, 1e-2);  // moves 10 % of the way
 }
 
+static void testTuning() {
+  TuningSettings t;
+  // All zero: passes the request through.
+  CHECK_NEAR(tuning::apply(0.4f, 0.5f, t), 0.4, 1e-6);
+  // Damping opposes speed.
+  t.damping = 0.2f;
+  CHECK_NEAR(tuning::apply(0, 0.5f, t), -0.1, 1e-6);
+  CHECK_NEAR(tuning::apply(0, -2.0f, t), 0.2, 1e-6);  // speed beyond full is capped
+  t.damping = 0;
+  // Friction: full drag at any real speed, none at rest.
+  t.friction = 0.1f;
+  CHECK_NEAR(tuning::apply(0, 0.3f, t), -0.1, 1e-6);
+  CHECK_NEAR(tuning::apply(0, 0, t), 0, 1e-6);
+  CHECK_NEAR(tuning::apply(0, -0.01f, t), 0.05, 1e-6);  // fading in
+  t.friction = 0;
+  // Min torque lifts small forces, keeps full force full, ignores ~zero.
+  t.minTorque = 0.1f;
+  CHECK_NEAR(tuning::apply(0.01f, 0, t), 0.109, 1e-6);
+  CHECK_NEAR(tuning::apply(-0.5f, 0, t), -0.55, 1e-6);
+  CHECK_NEAR(tuning::apply(1.0f, 0, t), 1.0, 1e-6);
+  CHECK_NEAR(tuning::apply(0.002f, 0, t), 0.002, 1e-6);
+  // Never exceeds +-1.
+  t.damping = 1.0f;
+  CHECK_NEAR(tuning::apply(-1.0f, 1.0f, t), -1.0, 1e-6);
+}
+
 int main() {
+  testTuning();
   testSafety();
   testVelocity();
   testSteering();

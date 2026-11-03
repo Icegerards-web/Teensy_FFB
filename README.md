@@ -7,7 +7,7 @@ Firmware for a DIY force-feedback steering wheel on a **Teensy 4.0**.
 | 1 | Wheel, pedals, buttons and paddles show up as a USB game controller | done |
 | 2 | Safe motor drive (BTS7960) with limits, end stops and a watchdog | done |
 | 3 | Force feedback from games (HID PID / DirectInput) | done (untested in games) |
-| 4 | Tuning and per-game testing (BeamNG, Live for Speed, F1 2020) | later |
+| 4 | Tuning and per-game testing (BeamNG, Live for Speed, F1 2020) | tuning tools done, see [docs/testing-and-tuning.md](docs/testing-and-tuning.md) |
 
 ## Files
 
@@ -25,6 +25,8 @@ firmware/teensy_ffb/
   FfbEngine.h/.cpp      force-feedback effects from games -> one torque
   FfbUsb.h/.cpp         connects the engine to the patched Teensy USB code
   FfbReportSizes.h      generated: byte size of each USB report
+  Tuning.h              always-on feel: damping, friction, minimum torque
+docs/testing-and-tuning.md  step-by-step bring-up, per-game notes, tuning table
 core_patch/usb_ffb_desc.h   generated: the USB HID descriptor (with force feedback)
 tools/
   patch_teensy_core.py  adds the "Serial + FFB Wheel" USB type to Teensyduino
@@ -117,6 +119,14 @@ still apply on top.
 - `invert on` flips the direction of the game's forces. If the wheel pulls
   you *into* corners instead of back towards straight, turn this on. Springs
   and dampers are calculated on the wheel and are never flipped.
+
+### Tuning (step 4)
+
+`damping N`, `friction N` and `mintorque N` shape the feel on top of the
+game, and `test spring|damper|constant|sine [N]` lets you feel effects without
+a game. `settings` prints everything. The full bring-up order, per-game notes
+for BeamNG, Live for Speed and F1 2020, and a tuning table are in
+[docs/testing-and-tuning.md](docs/testing-and-tuning.md).
 
 `monitor` prints all live readings 10 times per second, which is handy for
 checking wiring. A "SENSOR FAULT?" next to the steering reading means the pot is

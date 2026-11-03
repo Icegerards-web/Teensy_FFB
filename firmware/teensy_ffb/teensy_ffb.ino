@@ -44,6 +44,7 @@
 #include "FfbUsb.h"
 #include "ForceSafety.h"
 #include "PotPositionSensor.h"
+#include "Tuning.h"
 #include "config.h"
 
 #if !defined(USB_SERIAL_HID) && !defined(JOYSTICK_INTERFACE)
@@ -119,6 +120,12 @@ uint32_t lastHostOkMs = 0;    // last time the PC accepted a USB report
 uint32_t motorTestStartMs = 0;
 bool motorTestActive = false;
 constexpr float MOTOR_TEST_TORQUE = 0.15f;
+
+// Test effects you can switch on from the Serial Monitor to feel and tune the
+// wheel without a game ("test spring", "test off", ...).
+enum class TestEffect : uint8_t { Off, Spring, Damper, Constant, Sine };
+TestEffect testEffect = TestEffect::Off;
+float testStrength = 0.3f;  // 0..1
 
 // Loop stall guard: the main loop writes the time into `loopHeartbeatMs` on
 // every pass. A timer interrupt (which keeps firing even if loop() is stuck)
@@ -265,6 +272,24 @@ void updateMotor() {
   w.acceleration = acceleration.value() / FFB_FULL_ACCEL_DEG_S2;
   requested += ffbComputeForce(w, now) * cal.ffbGain;
 
+  // --- Test effects (no game needed) -------------------------------------------
+  switch (testEffect) {
+    case TestEffect::Off: break;
+    case TestEffect::Spring: requested -= testStrength * w.position; break;
+    case TestEffect::Damper: requested -= testStrength * w.velocity * 4.0f; break;
+    case TestEffect::Constant: requested += testStrength; break;
+    case TestEffect::Sine:  // 2 shakes per second, like a rumble strip
+      requested += testStrength * sinf(2.0f * 3.14159265f * 2.0f * (now % 1000) / 1000.0f);
+      break;
+  }
+
+  // --- Always-on feel: damping, friction, minimum torque (Tuning.h) ------------
+  TuningSettings ts;
+  ts.damping = cal.damping;
+  ts.friction = cal.friction;
+  ts.minTorque = cal.minTorque;
+  requested = tuning::apply(requested, w.velocity, ts);
+
   // --- Test command (end stops are added inside ForceSafety) ------------------
   if (motorTestActive) {
     uint32_t t = now - motorTestStartMs;
@@ -301,6 +326,9 @@ void updateMotor() {
 }
 
 // ----- Serial menu -----------------------------------------------------------
+int parseOnOff(const char* s);
+bool parsePercent(const char* s, float lo, float hi, float& out);
+
 void printHelp() {
   Serial.println(F(
       "Calibration:\n"
@@ -321,6 +349,13 @@ void printHelp() {
       "  gain N        overall strength of game forces in percent (e.g. gain 70)\n"
       "  invert on|off flip the direction of game forces (if the wheel pulls\n"
       "                the wrong way in corners)\n"
+      "Tuning (always on, on top of the game):\n"
+      "  damping N     resistance to fast turning, percent (stops wobble)\n"
+      "  friction N    constant drag when turning, percent\n"
+      "  mintorque N   lift small forces above the motor's sticking point\n"
+      "  test spring|damper|constant|sine [N]   feel an effect without a game\n"
+      "  test off      stop the test effect\n"
+      "  settings      print every setting\n"
       "Storage:\n"
       "  save          store settings so they survive power-off\n"
       "  reset         go back to default settings (then 'save' to keep)\n"
@@ -363,6 +398,43 @@ void printFfbStatus() {
   }
   Serial.printf("Our settings: gain %.0f%%, invert %s, max torque %.0f%%\n", cal.ffbGain * 100,
                 cal.ffbInvert ? "on" : "off", cal.maxTorque * 100);
+}
+
+void printSettings() {
+  Serial.printf("Steering: range %.0f deg, center %ld\n", cal.steeringRangeDeg,
+                (long)steering.centerCalibration());
+  Serial.printf("Motor: %s, autoarm %s, max torque %.0f%%, end stop %.0f%%/deg\n",
+                motorArmed ? "on" : "off", cal.armAtBoot ? "on" : "off", cal.maxTorque * 100,
+                cal.endstopStiffness * 100);
+  Serial.printf("FFB: gain %.0f%%, invert %s\n", cal.ffbGain * 100, cal.ffbInvert ? "on" : "off");
+  Serial.printf("Tuning: damping %.0f%%, friction %.0f%%, min torque %.0f%%\n",
+                cal.damping * 100, cal.friction * 100, cal.minTorque * 100);
+}
+
+// "test spring 30", "test sine", "test off", ...
+void handleTestCommand(char* args) {
+  char* num = strchr(args, ' ');
+  if (num) {
+    *num++ = '\0';
+    float pct;
+    if (!parsePercent(num, 0, 100, pct)) return;
+    testStrength = pct;
+  }
+  if (strcmp(args, "off") == 0) testEffect = TestEffect::Off;
+  else if (strcmp(args, "spring") == 0) testEffect = TestEffect::Spring;
+  else if (strcmp(args, "damper") == 0) testEffect = TestEffect::Damper;
+  else if (strcmp(args, "constant") == 0) testEffect = TestEffect::Constant;
+  else if (strcmp(args, "sine") == 0) testEffect = TestEffect::Sine;
+  else {
+    Serial.println(F("Use: test spring|damper|constant|sine [percent], or test off"));
+    return;
+  }
+  if (testEffect == TestEffect::Off) {
+    Serial.println(F("Test effect off."));
+  } else {
+    Serial.printf("Test effect on at %.0f%%%s\n", testStrength * 100,
+                  motorArmed ? "" : " (type 'motor on' to feel it)");
+  }
 }
 
 // Parses "on"/"off" after a command; returns -1 if neither.
@@ -426,6 +498,7 @@ void handleCommand(char* line) {
   } else if (strcmp(line, "motor off") == 0) {
     motorArmed = false;
     motorTestActive = false;
+    testEffect = TestEffect::Off;
     Serial.println(F("Motor OFF."));
   } else if (strcmp(line, "motor test") == 0) {
     if (!motorArmed) {
@@ -474,6 +547,25 @@ void handleCommand(char* line) {
       Serial.println(v ? F("Game forces inverted. Type 'save' to keep it.")
                        : F("Game forces normal. Type 'save' to keep it."));
     }
+  } else if (strncmp(line, "damping ", 8) == 0) {
+    if (parsePercent(line + 8, 0, 100, pct)) {
+      cal.damping = pct;
+      Serial.printf("Damping %.0f%%. Type 'save' to keep it.\n", pct * 100);
+    }
+  } else if (strncmp(line, "friction ", 9) == 0) {
+    if (parsePercent(line + 9, 0, 100, pct)) {
+      cal.friction = pct;
+      Serial.printf("Friction %.0f%%. Type 'save' to keep it.\n", pct * 100);
+    }
+  } else if (strncmp(line, "mintorque ", 10) == 0) {
+    if (parsePercent(line + 10, 0, 50, pct)) {
+      cal.minTorque = pct;
+      Serial.printf("Min torque %.0f%%. Type 'save' to keep it.\n", pct * 100);
+    }
+  } else if (strncmp(line, "test ", 5) == 0) {
+    handleTestCommand(line + 5);
+  } else if (strcmp(line, "settings") == 0) {
+    printSettings();
   } else if (strcmp(line, "save") == 0) {
     cal.steeringCenter = steering.centerCalibration();
     calibration::save(cal);
