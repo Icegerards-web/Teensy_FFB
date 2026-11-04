@@ -96,6 +96,8 @@ struct Effect {
   // Playback
   uint32_t startMs = 0;      // when it (re)started, after the start delay
   uint8_t loopCount = 1;
+  // Diagnostics: this effect's share of the last computeForce(), -1..1.
+  float lastForce = 0;
 };
 
 // The wheel's state, in the units the engine wants.

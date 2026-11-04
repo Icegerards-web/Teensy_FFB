@@ -143,6 +143,11 @@ void stallGuardIsr() {
 }
 
 bool monitorOn = false;
+// Machine-readable stream for tools/ffb_monitor.py ("stream on").
+bool streamOn = false;
+elapsedMillis sinceStream;
+float lastGameForce = 0;   // game forces after our gain, -1..1
+float lastRequested = 0;   // everything we asked for, before ForceSafety
 elapsedMicros sinceReport;   // Teensy helper: counts up microseconds by itself
 elapsedMillis sinceMonitor;
 
@@ -270,7 +275,8 @@ void updateMotor() {
   w.position = axis::steeringFraction(steering.angleDeg(), cal.steeringRangeDeg);
   w.velocity = velocity.value() / FFB_FULL_SPEED_DEG_S;
   w.acceleration = acceleration.value() / FFB_FULL_ACCEL_DEG_S2;
-  requested += ffbComputeForce(w, now) * cal.ffbGain;
+  lastGameForce = ffbComputeForce(w, now) * cal.ffbGain;
+  requested += lastGameForce;
 
   // --- Test effects (no game needed) -------------------------------------------
   switch (testEffect) {
@@ -313,6 +319,7 @@ void updateMotor() {
   in.nowMs = now;
 
   SafetyState before = safety.state();
+  lastRequested = requested;
   float torque = safety.process(in);
   motor.setTorque(torque);
 
@@ -356,6 +363,7 @@ void printHelp() {
       "  test spring|damper|constant|sine [N]   feel an effect without a game\n"
       "  test off      stop the test effect\n"
       "  settings      print every setting\n"
+      "  stream on|off data stream for tools/ffb_monitor.py\n"
       "Storage:\n"
       "  save          store settings so they survive power-off\n"
       "  reset         go back to default settings (then 'save' to keep)\n"
@@ -435,6 +443,40 @@ void handleTestCommand(char* args) {
     Serial.printf("Test effect on at %.0f%%%s\n", testStrength * 100,
                   motorArmed ? "" : " (type 'motor on' to feel it)");
   }
+}
+
+// One snapshot for the PC monitor app (tools/ffb_monitor.py). Every line
+// starts with '@' so the app can tell it apart from normal messages:
+//   @S key=value ...   overall state, once per snapshot
+//   @E key=value ...   one line per effect the game has created
+//   @END               end of this snapshot
+// Forces are fractions of full motor power, -1..1 (+ = right).
+void printStream() {
+  // If the PC app closed the port, stop streaming. If the PC isn't reading
+  // fast enough (USB buffer nearly full), skip this snapshot: a full buffer
+  // would make Serial.print wait, and the wheel must never wait on the PC.
+  if (!Serial) {
+    streamOn = false;
+    return;
+  }
+  if (Serial.availableForWrite() < 256) return;
+  static ffb::Engine snap;  // static: too big to put on the stack every time
+  ffbSnapshot(snap);
+  Serial.printf("@S t=%lu ffb=%d ang=%.2f pos=%.4f vel=%.1f game=%.4f req=%.4f out=%.4f "
+                "armed=%d state=%d act=%d paused=%d dgain=%d reports=%lu\n",
+                (unsigned long)millis(), HAVE_FFB, steering.angleDeg(),
+                axis::steeringFraction(steering.angleDeg(), cal.steeringRangeDeg),
+                velocity.value(), lastGameForce, lastRequested, motor.torque(), motorArmed,
+                (int)safety.state(), snap.actuatorsEnabled(), snap.paused(), snap.deviceGain(),
+                (unsigned long)snap.reportCount());
+  for (unsigned i = 1; i <= ffb_size::MAX_EFFECTS; i++) {
+    const ffb::Effect& e = snap.effect(i);
+    if (e.type == ffb::ET_NONE) continue;
+    if (Serial.availableForWrite() < 64) break;
+    Serial.printf("@E i=%u type=%u play=%d gain=%u f=%.4f\n", i, e.type, e.playing, e.gain,
+                  e.lastForce);
+  }
+  Serial.println(F("@END"));
 }
 
 // Parses "on"/"off" after a command; returns -1 if neither.
@@ -564,6 +606,9 @@ void handleCommand(char* line) {
     }
   } else if (strncmp(line, "test ", 5) == 0) {
     handleTestCommand(line + 5);
+  } else if (strncmp(line, "stream ", 7) == 0) {
+    int v = parseOnOff(line + 7);
+    if (v >= 0) streamOn = v;
   } else if (strcmp(line, "settings") == 0) {
     printSettings();
   } else if (strcmp(line, "save") == 0) {
@@ -614,5 +659,10 @@ void loop() {
   if (monitorOn && sinceMonitor >= 100) {
     sinceMonitor = 0;
     printReadings();
+  }
+
+  if (streamOn && sinceStream >= STREAM_INTERVAL_MS) {
+    sinceStream = 0;
+    printStream();
   }
 }

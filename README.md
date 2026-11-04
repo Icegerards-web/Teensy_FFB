@@ -32,6 +32,7 @@ tools/
   patch_teensy_core.py  adds the "Serial + FFB Wheel" USB type to Teensyduino
   gen_ffb_descriptor.py generates the descriptor (only needed to change it)
   pio_patch_core.py     PlatformIO runs the patch automatically with this
+  ffb_monitor.py        PC window that shows the force feedback games send
   Calibration.h         stores calibration in EEPROM so it survives power-off
 test/                   unit tests for AxisMath + Debouncer that run on a PC
 platformio.ini          optional PlatformIO build file
@@ -128,6 +129,32 @@ a game. `settings` prints everything. The full bring-up order, per-game notes
 for BeamNG, Live for Speed and F1 2020, and a tuning table are in
 [docs/testing-and-tuning.md](docs/testing-and-tuning.md).
 
+### FFB Monitor (see what the game sends)
+
+![FFB Monitor in demo mode](docs/ffb-monitor.png)
+
+`tools/ffb_monitor.py` is a small window for the PC that shows, live, whether
+a game is sending force feedback: a big yes/no light, every effect the game
+created (spring, constant force, rumble...) and how much force each adds, the
+total game force vs. what the motor really gets, and a 10-second graph.
+
+1. Once: `pip install pyserial` (Python 3.8 or newer; the window itself uses
+   tkinter, which comes with the normal Windows Python installer).
+2. **Close the Arduino Serial Monitor** (only one program can use the port).
+3. `python tools/ffb_monitor.py`, pick the Teensy port, click Connect.
+4. Start the game. The light turns green when force feedback arrives.
+
+`python tools/ffb_monitor.py --demo` shows a simulated wheel so you can try
+the window without hardware. The box at the bottom works like the Serial
+Monitor, so you can type `motor on`, `gain 60` etc. there too.
+
+How it works: the app types `stream on`, and the firmware then sends a
+snapshot of the force-feedback engine 20 times a second as text lines that
+start with `@`. The firmware counts every force-feedback report the PC sends;
+if that count goes up, the game is talking to the wheel. The firmware skips a
+snapshot rather than wait if the PC falls behind, so the monitor can never
+slow the wheel down.
+
 `monitor` prints all live readings 10 times per second, which is handy for
 checking wiring. A "SENSOR FAULT?" next to the steering reading means the pot is
 reading at the very end of its range, usually a loose wiper wire.
@@ -206,4 +233,5 @@ compiler. The FFB tests replay the same sequence of reports Windows sends:
 
 ```
 ./test/run_tests.sh
+python test/test_ffb_monitor.py
 ```

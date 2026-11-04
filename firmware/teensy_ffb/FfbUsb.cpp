@@ -56,9 +56,16 @@ float ffbComputeForce(const ffb::WheelState& w, uint32_t nowMs) {
   return f;
 }
 
+void ffbSnapshot(ffb::Engine& out) {
+  NVIC_DISABLE_IRQ(IRQ_USB1);
+  out = ffbEngine;
+  NVIC_ENABLE_IRQ(IRQ_USB1);
+}
+
 #else  // no FFB USB type: harmless stand-ins so the sketch still builds
 
 bool ffbSendWheelReport(int16_t, uint16_t, uint16_t, uint16_t, uint32_t) { return false; }
 float ffbComputeForce(const ffb::WheelState&, uint32_t) { return 0; }
+void ffbSnapshot(ffb::Engine& out) { out = ffbEngine; }
 
 #endif

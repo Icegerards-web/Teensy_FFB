@@ -152,3 +152,6 @@ constexpr float DEFAULT_MIN_TORQUE = 0.00f;  // overcome motor/gear stiction
 // torque. Lower = those effects feel stronger.
 constexpr float FFB_FULL_SPEED_DEG_S  = 360.0f;   // one turn per second
 constexpr float FFB_FULL_ACCEL_DEG_S2 = 5000.0f;
+
+// How often "stream on" sends a snapshot to tools/ffb_monitor.py (ms).
+constexpr uint32_t STREAM_INTERVAL_MS = 50;  // 20 times per second
