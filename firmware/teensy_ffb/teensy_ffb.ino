@@ -452,13 +452,12 @@ void handleTestCommand(char* args) {
 //   @END               end of this snapshot
 // Forces are fractions of full motor power, -1..1 (+ = right).
 void printStream() {
-  // If the PC app closed the port, stop streaming. If the PC isn't reading
-  // fast enough (USB buffer nearly full), skip this snapshot: a full buffer
-  // would make Serial.print wait, and the wheel must never wait on the PC.
-  if (!Serial) {
-    streamOn = false;
-    return;
-  }
+  // Skip this snapshot (but keep streaming) if no program has the port open,
+  // or if the PC isn't reading fast enough (USB buffer nearly full): a full
+  // buffer would make Serial.print wait, and the wheel must never wait on the
+  // PC. Note: right after a program opens the port, Teensyduino reports it as
+  // closed for 15 ms, so we must not switch the stream off here.
+  if (!Serial) return;
   if (Serial.availableForWrite() < 256) return;
   static ffb::Engine snap;  // static: too big to put on the stack every time
   ffbSnapshot(snap);

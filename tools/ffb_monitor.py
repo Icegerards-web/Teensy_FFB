@@ -475,6 +475,7 @@ class App:
         self.connect_btn.configure(text="Disconnect")
         self.conn_label.configure(text=f"Connected to {name}", fg=COLORS["good"])
         self.activity = ActivityTracker()
+        self.last_snapshot_time = time.time()  # give the wheel a moment first
 
     def disconnect(self):
         self.running = False
@@ -543,6 +544,14 @@ class App:
             self.last_snapshot_time = now
             self._show(latest, now)
         elif self.running and now - self.last_snapshot_time > 1.5:
+            # Ask again: the first "stream on" can get lost if it arrives
+            # while the Teensy is still noticing that the port was opened.
+            if now - getattr(self, "last_stream_request", 0) > 1.0 and self.source:
+                self.last_stream_request = now
+                try:
+                    self.source.write("stream on")
+                except Exception:
+                    pass
             self._set_lamp("warn")
             self.big.configure(text="Connected, but no data from the wheel")
             self.detail.configure(text="Is the latest firmware uploaded? It needs the "
