@@ -31,6 +31,7 @@ PlatformIO users don't need to run it: platformio.ini does it automatically.
 """
 import glob
 import os
+import re
 import shutil
 import sys
 
@@ -142,12 +143,19 @@ def patch_usb_desc_h(text):
 
 
 def patch_usb_desc_c(text):
-    anchor = "#ifdef JOYSTICK_INTERFACE\n#if JOYSTICK_SIZE == 12"
-    if anchor not in text:
+    # The stock line is "#ifdef JOYSTICK_INTERFACE", but cores that were
+    # modified before (e.g. "#if defined(JOYSTICK_INTERFACE) && !defined(X)")
+    # are accepted too, as long as the joystick descriptor block follows.
+    m = re.search(r"^[ \t]*#[ \t]*(?:ifdef[ \t]+JOYSTICK_INTERFACE|if[ \t]+defined[ \t]*\(?[ \t]*"
+                  r"JOYSTICK_INTERFACE\b[^\n]*)[ \t]*\n[ \t]*#[ \t]*if[ \t]+JOYSTICK_SIZE[ \t]*==[ \t]*12",
+                  text, re.M)
+    if not m:
         raise PatchError("usb_desc.c: joystick report descriptor not found")
-    start = text.index(anchor)
-    end_marker = "#endif // JOYSTICK_INTERFACE"
-    end = text.index(end_marker, start) + len(end_marker)
+    start = m.start()
+    end_m = re.compile(r"#[ \t]*endif[ \t]*//[ \t]*JOYSTICK_INTERFACE[^\n]*").search(text, start)
+    if not end_m:
+        raise PatchError("usb_desc.c: end of the joystick report descriptor not found")
+    end = end_m.end()
     text = (text[:start]
             + "#if defined(USB_FFB_WHEEL) // TEENSY_FFB_PATCH\n#include \"usb_ffb_desc.h\"\n#else\n"
             + text[start:end]
@@ -175,17 +183,23 @@ def patch_usb_c(text):
     return text
 
 
-def patch_file(path, fn):
+def prepare_patch(path, fn):
+    """Works out the patched text without writing anything. Returns the new
+    text, or None if the file is already patched. Raises PatchError."""
     with open(path, newline="") as f:
         text = f.read()
     if MARK in text:
         print(f"  already patched: {path}")
-        return
+        return None
     crlf = "\r\n" in text
     text = text.replace("\r\n", "\n")
     new = fn(text)
     if crlf:
         new = new.replace("\n", "\r\n")
+    return new
+
+
+def write_patch(path, new):
     if not os.path.exists(path + ".orig"):
         shutil.copy2(path, path + ".orig")
     with open(path, "w", newline="") as f:
@@ -243,12 +257,20 @@ def find_cores():
 
 def patch_core(core):
     print(f"Patching {core}")
+    # Work out all three changes first, and only write if every one of them
+    # succeeds, so a core is never left half-patched.
+    jobs = [("usb_desc.h", patch_usb_desc_h), ("usb_desc.c", patch_usb_desc_c),
+            ("usb.c", patch_usb_c)]
+    results = []
+    for name, fn in jobs:
+        path = os.path.join(core, name)
+        results.append((path, prepare_patch(path, fn)))
     shutil.copy2(os.path.join(ROOT, "core_patch", "usb_ffb_desc.h"),
                  os.path.join(core, "usb_ffb_desc.h"))
     print(f"  copied: usb_ffb_desc.h")
-    patch_file(os.path.join(core, "usb_desc.h"), patch_usb_desc_h)
-    patch_file(os.path.join(core, "usb_desc.c"), patch_usb_desc_c)
-    patch_file(os.path.join(core, "usb.c"), patch_usb_c)
+    for path, new in results:
+        if new is not None:
+            write_patch(path, new)
     boards = os.path.join(os.path.dirname(os.path.dirname(core)), "boards.txt")
     if os.path.exists(boards):
         patch_boards_txt(boards)
@@ -261,11 +283,14 @@ def main(argv):
               "  python tools/patch_teensy_core.py "
               "\"C:/Users/<you>/AppData/Local/Arduino15/packages/teensy/hardware/avr/1.59.0/cores/teensy4\"")
         return 1
-    try:
-        for c in cores:
+    failed = False
+    for c in cores:
+        try:
             patch_core(c)
-    except PatchError as e:
-        print(f"ERROR: {e}")
+        except PatchError as e:
+            print(f"  ERROR: {e}\n  (nothing was changed in this core)")
+            failed = True
+    if failed:
         return 1
     print("Done. In the Arduino IDE choose Tools > USB Type > 'Serial + FFB Wheel'.")
     return 0
