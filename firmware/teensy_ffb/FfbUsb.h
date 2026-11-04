@@ -29,3 +29,7 @@ bool ffbSendWheelReport(int16_t steering, uint16_t throttle, uint16_t brake, uin
 // Runs the engine with the USB interrupt paused, so a report arriving halfway
 // through can't leave an effect half-updated.
 float ffbComputeForce(const ffb::WheelState& w, uint32_t nowMs);
+
+// Copies the whole engine state (with the USB interrupt paused), so the
+// monitor stream can print a consistent picture without blocking USB.
+void ffbSnapshot(ffb::Engine& out);

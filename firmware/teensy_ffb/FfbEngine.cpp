@@ -352,7 +352,10 @@ float Engine::effectForce(Effect& e, const WheelState& w, uint32_t nowMs) {
 
 float Engine::computeForce(const WheelState& w, uint32_t nowMs) {
   float total = 0;
-  for (Effect& e : effects_) total += effectForce(e, w, nowMs);
+  for (Effect& e : effects_) {
+    e.lastForce = effectForce(e, w, nowMs);
+    total += e.lastForce;
+  }
   if (paused_ || !actuatorsEnabled_) return 0;
   total *= (float)deviceGain_ / 255.0f;
   return clampf(total, -1.0f, 1.0f);

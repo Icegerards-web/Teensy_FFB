@@ -42,8 +42,9 @@ nothing is kept after a power cycle until you type `save`.
 
 Start with games that are known to have good DirectInput force feedback.
 
-**Before the first game:** type `ffb` while the game is running. You should
-see effects being created and "PLAYING". If you see `0 effects created` the
+**Before the first game:** run the FFB Monitor (`python tools/ffb_monitor.py`,
+see the README) next to the game, or type `ffb` in the Serial Monitor while the
+game is running. You should see effects being created and "PLAYING". If you see `0 effects created` the
 game isn't sending force feedback to this wheel: check that the wheel is
 selected as the FFB device in the game's controls menu.
 
